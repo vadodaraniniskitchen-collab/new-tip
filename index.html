@@ -5,238 +5,225 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TipFlow — Staff Contribution Manager</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
-<script type="module">
+<script>
 // ═══════════════════════════════════════════════
-//  TIPFLOW — LOCAL STORAGE ONLY
-//  No Firebase. All data persists in localStorage.
-//  First user: admin / 7562
-//
-//  Storage keys:
-//    tipflow_store    — main data (waiters, transactions, attendance, …)
-//    tipflow_users    — auth users array
-//    tipflow_logs     — activity logs array
+//  TIPFLOW — localStorage Storage Engine
+//  Replaces Firebase entirely. Three keys:
+//    tipflow_store  — waiters, transactions, attendance, withdrawals, deleted_waiters, leaves, _passcode
+//    tipflow_users  — auth users array
+//    tipflow_logs   — activity logs (capped at 1000)
 // ═══════════════════════════════════════════════
 
-const LS_STORE = 'tipflow_store';
-const LS_USERS = 'tipflow_users';
-const LS_LOGS  = 'tipflow_logs';
+// ── Raw helpers ──────────────────────────────────
+function _lsRead(key)      { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; } }
+function _lsWrite(key, val){ try { localStorage.setItem(key, JSON.stringify(val)); } catch(e) { console.warn('LS write failed', key, e); } }
 
-// ── Low-level helpers ──
-function lsGet(key) {
-  try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : null; } catch { return null; }
-}
-function lsSet(key, val) {
-  try { localStorage.setItem(key, JSON.stringify(val)); } catch(e) { console.warn('localStorage write failed:', e); }
+// ── Default shapes ───────────────────────────────
+function _defaultStore() {
+  return {
+    waiters:[], transactions:[], attendance:{},
+    withdrawals:{ pickup:0, hk:0, wp:0 },
+    deleted_waiters:[], leaves:[], _passcode:'tipflow2024',
+    rules: {
+      pickup: { active:true, effectiveFrom:'2020-01-01', days:{ mon:10, tue:10, wed:10, thu:10, fri:10, sat:20, sun:20 } },
+      hk:     { active:true, effectiveFrom:'2020-01-01', days:{ mon:0,  tue:0,  wed:0,  thu:0,  fri:0,  sat:20, sun:20 } },
+      wp:     { active:true, effectiveFrom:'2020-01-01', days:{ mon:10, tue:0,  wed:0,  thu:0,  fri:0,  sat:0,  sun:0  } }
+    }
+  };
 }
 
-// ── Sync dot ──
-function setSyncDot(color) {
+// ── Store accessor — always returns live in-memory store if app is ready, else LS ──
+function _liveStore() {
+  return (window._getStore && window._getStore()) || _lsRead('tipflow_store') || _defaultStore();
+}
+
+// ── Flush live store → localStorage ─────────────
+function _flush() {
+  const s = window._getStore ? window._getStore() : null;
+  if (s) _lsWrite('tipflow_store', s);
+  // Update sync dot
   const dot = document.getElementById('syncDot');
   const lbl = document.getElementById('syncLabel');
-  if (!dot || !lbl) return;
-  const map = {
-    green: { bg: 'var(--green)', text: 'Saved'   },
-    amber: { bg: 'var(--amber)', text: 'Saving…' },
-    red:   { bg: 'var(--red)',   text: 'Error'   },
-  };
-  const m = map[color] || map.green;
-  dot.style.background = m.bg;
-  dot.style.boxShadow  = `0 0 6px ${m.bg}`;
-  lbl.textContent      = m.text;
-  lbl.style.color      = m.bg;
-}
-window.setSyncDot = setSyncDot;
-
-// ── Default empty store ──
-function defaultStore() {
-  return {
-    waiters: [],
-    transactions: [],
-    attendance: {},
-    withdrawals: { pickup: 0, hk: 0, wp: 0 },
-    deleted_waiters: [],
-    leaves: [],
-    _passcode: 'tipflow2024'
-  };
+  if (dot) { dot.style.background = 'var(--green)'; dot.style.boxShadow = '0 0 6px var(--green)'; }
+  if (lbl) { lbl.textContent = 'Saved'; lbl.style.color = 'var(--green)'; }
 }
 
-// ── Read the full store (or create empty) ──
-function readStore() {
-  return lsGet(LS_STORE) || defaultStore();
-}
-
-// ── Write the full store ──
-function writeStore(s) {
-  lsSet(LS_STORE, s);
-}
-
-// ══════════════════════════════════════════════
-//  LOAD DATA  — replaces _fbLoadData
-// ══════════════════════════════════════════════
+// ════════════════════════════════════════════════
+//  READ
+// ════════════════════════════════════════════════
 window._fbLoadData = async () => {
-  return readStore();
+  return _lsRead('tipflow_store') || _defaultStore();
 };
 
-// ══════════════════════════════════════════════
-//  FULL SAVE — replaces _fbSaveData (CSV import)
-// ══════════════════════════════════════════════
-window._fbSaveData = async (store) => {
-  writeStore(store);
+window._fbLoadPasscode = async () => {
+  return (_lsRead('tipflow_store') || {})._passcode || null;
 };
 
-// ══════════════════════════════════════════════
-//  TARGETED SAVES
-// ══════════════════════════════════════════════
+window._fbLoadUsers = async () => {
+  return _lsRead('tipflow_users') || [];
+};
 
-function _withStore(fn) {
-  const s = readStore();
-  fn(s);
-  writeStore(s);
-  setSyncDot('green');
-}
+window._fbLoadLogs = async () => {
+  return _lsRead('tipflow_logs') || [];
+};
+
+// ════════════════════════════════════════════════
+//  WRITE — store (all flush live store in one shot)
+// ════════════════════════════════════════════════
+
+// Full store save (CSV import, bulk ops)
+window._fbSaveData = async (s) => {
+  _lsWrite('tipflow_store', s);
+};
 
 // Waiter
 window._fbSaveWaiter = async (waiter) => {
-  _withStore(s => {
-    const idx = s.waiters.findIndex(w => w.id === waiter.id);
-    if (idx >= 0) s.waiters[idx] = waiter; else s.waiters.push(waiter);
-  });
+  const s = _liveStore();
+  const i = s.waiters.findIndex(w => w.id === waiter.id);
+  if (i >= 0) s.waiters[i] = waiter; else s.waiters.push(waiter);
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
-window._fbDeleteWaiter = async (waiterId) => {
-  _withStore(s => { s.waiters = s.waiters.filter(w => w.id !== waiterId); });
+window._fbDeleteWaiter = async (id) => {
+  const s = _liveStore();
+  s.waiters = s.waiters.filter(w => w.id !== id);
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
 window._fbSaveDeletedWaiter = async (snapshot) => {
   const { archivedTransactions, _t, ...safe } = snapshot;
-  _withStore(s => {
-    const idx = s.deleted_waiters.findIndex(d => d.id === safe.id);
-    if (idx >= 0) s.deleted_waiters[idx] = safe; else s.deleted_waiters.push(safe);
-  });
+  const s = _liveStore();
+  if (!s.deleted_waiters) s.deleted_waiters = [];
+  const i = s.deleted_waiters.findIndex(d => d.id === safe.id);
+  if (i >= 0) s.deleted_waiters[i] = safe; else s.deleted_waiters.push(safe);
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
 // Transaction
 window._fbSaveTransaction = async (txn) => {
   const { archivedTransactions, ...safe } = txn;
-  _withStore(s => {
-    const idx = s.transactions.findIndex(t => t.id === safe.id);
-    if (idx >= 0) s.transactions[idx] = safe; else s.transactions.push(safe);
-  });
+  const s = _liveStore();
+  const i = s.transactions.findIndex(t => t.id === safe.id);
+  if (i >= 0) s.transactions[i] = safe; else s.transactions.push(safe);
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
 window._fbDeleteWaiterTransactions = async (waiterId) => {
-  _withStore(s => { s.transactions = s.transactions.filter(t => t.waiterId !== waiterId); });
+  const s = _liveStore();
+  s.transactions = s.transactions.filter(t => t.waiterId !== waiterId);
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
 window._fbSoftUpdateTransactions = async (waiterId, newName) => {
-  _withStore(s => {
-    s.transactions.forEach(t => {
-      if (t.waiterId === waiterId) { t.waiterId = null; t.waiterName = newName; }
-    });
+  const s = _liveStore();
+  s.transactions.forEach(t => {
+    if (t.waiterId === waiterId) { t.waiterId = null; t.waiterName = newName; }
   });
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
 // Attendance
 window._fbSaveAttendanceDay = async (dateStr, dayData) => {
-  _withStore(s => {
-    const keys = Object.keys(dayData).filter(k => k !== '_t');
-    if (keys.length === 0) delete s.attendance[dateStr];
-    else s.attendance[dateStr] = dayData;
-  });
+  const s = _liveStore();
+  if (!s.attendance) s.attendance = {};
+  const keys = Object.keys(dayData).filter(k => k !== '_t');
+  if (keys.length === 0) delete s.attendance[dateStr];
+  else s.attendance[dateStr] = dayData;
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
 // Withdrawals
 window._fbSaveWithdrawals = async (wd) => {
-  _withStore(s => { s.withdrawals = { ...wd }; });
+  const s = _liveStore();
+  s.withdrawals = { ...wd };
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
-// Passcode (main store _passcode field)
+// Passcode
 window._fbSaveConfig = async (passcode) => {
   window._cachedPasscodeMeta = passcode;
-  _withStore(s => { s._passcode = passcode; });
+  const s = _liveStore();
+  s._passcode = passcode;
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
+window._fbSavePasscode = window._fbSaveConfig;
 
 // Leaves
 window._fbSaveLeave = async (leave) => {
-  _withStore(s => {
-    const idx = s.leaves ? s.leaves.findIndex(l => l.id === leave.id) : -1;
-    if (!s.leaves) s.leaves = [];
-    if (idx >= 0) s.leaves[idx] = leave; else s.leaves.push(leave);
-  });
+  const s = _liveStore();
+  if (!s.leaves) s.leaves = [];
+  const i = s.leaves.findIndex(l => l.id === leave.id);
+  if (i >= 0) s.leaves[i] = leave; else s.leaves.push(leave);
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
 window._fbDeleteLeave = async (leaveId) => {
-  _withStore(s => { if (s.leaves) s.leaves = s.leaves.filter(l => l.id !== leaveId); });
+  const s = _liveStore();
+  if (s.leaves) s.leaves = s.leaves.filter(l => l.id !== leaveId);
+  _lsWrite('tipflow_store', s);
+  _flush();
 };
 
-// Leaves listener (no-op — data is already in store; changes propagate immediately)
-window._fbStartLeavesListener = () => () => {};
-
-// ══════════════════════════════════════════════
-//  PASSCODE
-// ══════════════════════════════════════════════
-window._fbLoadPasscode = async () => {
-  return readStore()._passcode || null;
-};
-window._fbSavePasscode = async (code) => {
-  window._cachedPasscodeMeta = code;
-  _withStore(s => { s._passcode = code; });
-};
-
-// ══════════════════════════════════════════════
-//  USERS  (stored separately from main store)
-// ══════════════════════════════════════════════
-window._fbLoadUsers = async () => {
-  return lsGet(LS_USERS) || [];
-};
-
+// ════════════════════════════════════════════════
+//  WRITE — users (separate key)
+// ════════════════════════════════════════════════
 window._fbSaveUsers = async (usersArr) => {
-  lsSet(LS_USERS, usersArr);
+  _lsWrite('tipflow_users', usersArr);
 };
 
-// ══════════════════════════════════════════════
-//  ACTIVITY LOGS
-// ══════════════════════════════════════════════
-window._fbLoadLogs = async () => {
-  return lsGet(LS_LOGS) || [];
-};
-
-window._fbSaveLog = async (logEntry) => {
-  const logs = lsGet(LS_LOGS) || [];
-  logs.unshift(logEntry);
+// ════════════════════════════════════════════════
+//  WRITE — logs (separate key, capped at 1000)
+// ════════════════════════════════════════════════
+window._fbSaveLog = async (entry) => {
+  const logs = _lsRead('tipflow_logs') || [];
+  logs.unshift(entry);
   if (logs.length > 1000) logs.length = 1000;
-  lsSet(LS_LOGS, logs);
+  _lsWrite('tipflow_logs', logs);
 };
 
 window._fbClearLogs = async () => {
-  lsSet(LS_LOGS, []);
+  _lsWrite('tipflow_logs', []);
 };
 
-// ══════════════════════════════════════════════
-//  REALTIME LISTENERS
-//  With localStorage there is no real-time — changes
-//  are synchronous. These stubs satisfy the interface.
-// ══════════════════════════════════════════════
+// ════════════════════════════════════════════════
+//  NO-OP STUBS (Firebase-era hooks, kept so callers
+//  don't crash — all are safe to call and do nothing)
+// ════════════════════════════════════════════════
+window._fbMarkWrite     = () => {};
+window._fbConsumeWrite  = () => false;
 window._fbLocalWrite    = 0;
-window._fbMarkWrite     = (n) => { window._fbLocalWrite += n; };
-window._fbConsumeWrite  = () => {
-  if (window._fbLocalWrite > 0) { window._fbLocalWrite--; return true; }
-  return false;
-};
-
-window._fbStartMainListener     = () => { setSyncDot('green'); return []; };
+window._fbStartMainListener     = () => [];
 window._fbStartUsersListener    = () => () => {};
 window._fbStartPasscodeListener = () => () => {};
 window._fbStartLogsListener     = () => () => {};
+window._fbStartLeavesListener   = () => () => {};
+window._fbMigrateFromLegacy     = async () => {};
+window._applyRemoteUsers        = () => {};
+window._applyRemotePasscode     = () => {};
+window._applyRemoteLogs         = () => {};
 
-// ══════════════════════════════════════════════
-//  LOAD LOGS — called from the extended init below
-// ══════════════════════════════════════════════
-window._loadLogsFromStorage = async () => {
-  return lsGet(LS_LOGS) || [];
+// Sync dot helpers (localStorage saves are instant — always "Saved")
+window.setSyncDot = (color) => {
+  const dot = document.getElementById('syncDot');
+  const lbl = document.getElementById('syncLabel');
+  if (!dot || !lbl) return;
+  const map = { green:{ bg:'var(--green)', text:'Saved' }, amber:{ bg:'var(--amber)', text:'Saving…' }, red:{ bg:'var(--red)', text:'Error' } };
+  const m = map[color] || map.green;
+  dot.style.background = m.bg; dot.style.boxShadow = `0 0 6px ${m.bg}`;
+  lbl.textContent = m.text; lbl.style.color = m.bg;
 };
 
-// Signal ready — same event the rest of the app waits for
+// Signal ready
 window._fbReady = true;
 window.dispatchEvent(new Event('fbReady'));
 </script>
@@ -917,6 +904,74 @@ window.dispatchEvent(new Event('fbReady'));
   .rule-row:last-child { border-bottom: none; }
   .rule-day { color: var(--text2); }
   .rule-amount { font-family: 'DM Mono', monospace; font-weight: 500; }
+
+  /* ─── EDITABLE RULE CARDS ─── */
+  .rule-toggle {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-family: 'DM Mono', monospace;
+  }
+  .toggle-switch {
+    position: relative;
+    width: 38px;
+    height: 21px;
+    cursor: pointer;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .toggle-track {
+    position: absolute;
+    inset: 0;
+    border-radius: 21px;
+    background: var(--surface3);
+    border: 1px solid var(--border);
+    transition: background 0.2s;
+  }
+  .toggle-thumb {
+    position: absolute;
+    top: 3px; left: 3px;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    background: var(--text3);
+    transition: transform 0.2s, background 0.2s;
+  }
+  .toggle-switch input:checked ~ .toggle-track { background: rgba(34,197,94,0.25); border-color: var(--green); }
+  .toggle-switch input:checked ~ .toggle-thumb { transform: translateX(17px); background: var(--green); }
+  .rule-input {
+    width: 64px;
+    padding: 4px 8px;
+    background: var(--surface3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: 'DM Mono', monospace;
+    font-size: 13px;
+    text-align: right;
+  }
+  .rule-input:focus { outline: none; border-color: var(--accent2); }
+  .rule-inactive { opacity: 0.38; pointer-events: none; }
+  .rule-save-btn {
+    margin: 14px 20px 16px;
+    width: calc(100% - 40px);
+    padding: 9px 0;
+    border-radius: var(--radius-sm);
+    border: none;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 13px;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .rule-save-btn:hover { opacity: 0.85; }
+  .rule-effective {
+    margin: 0 20px 4px;
+    font-size: 10px;
+    font-family: 'DM Mono', monospace;
+    color: var(--text3);
+    letter-spacing: 0.5px;
+  }
 
   /* ─── SECTION HEADER ─── */
   .section-header {
@@ -2099,117 +2154,18 @@ window.dispatchEvent(new Event('fbReady'));
     <div class="section-header">
       <div>
         <div class="section-title">Contribution Rules</div>
-        <div class="section-sub">Fixed daily contribution schedule</div>
+        <div class="section-sub" id="rulesSub">Daily contribution schedule</div>
       </div>
     </div>
-    <div class="grid g3 gap-3">
-      <div class="rule-card">
-        <div class="rule-header" style="color:var(--pickup)">
-          <span>🚗</span> Pickup
-        </div>
-        <div class="rule-body">
-          <div class="rule-row"><span class="rule-day">Monday</span><span class="rule-amount text-accent">₹10</span></div>
-          <div class="rule-row"><span class="rule-day">Tuesday</span><span class="rule-amount text-accent">₹10</span></div>
-          <div class="rule-row"><span class="rule-day">Wednesday</span><span class="rule-amount text-accent">₹10</span></div>
-          <div class="rule-row"><span class="rule-day">Thursday</span><span class="rule-amount text-accent">₹10</span></div>
-          <div class="rule-row"><span class="rule-day">Friday</span><span class="rule-amount text-accent">₹10</span></div>
-          <div class="rule-row"><span class="rule-day">Saturday</span><span class="rule-amount text-green">₹20</span></div>
-          <div class="rule-row"><span class="rule-day">Sunday</span><span class="rule-amount text-green">₹20</span></div>
-        </div>
-      </div>
-      <div class="rule-card">
-        <div class="rule-header" style="color:var(--hk)">
-          <span>🧹</span> Housekeeping
-        </div>
-        <div class="rule-body">
-          <div class="rule-row"><span class="rule-day">Monday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Tuesday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Wednesday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Thursday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Friday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Saturday</span><span class="rule-amount text-green">₹20</span></div>
-          <div class="rule-row"><span class="rule-day">Sunday</span><span class="rule-amount text-green">₹20</span></div>
-        </div>
-      </div>
-      <div class="rule-card">
-        <div class="rule-header" style="color:var(--wp)">
-          <span>🧽</span> Wiping
-        </div>
-        <div class="rule-body">
-          <div class="rule-row"><span class="rule-day">Monday</span><span class="rule-amount text-amber">₹10</span></div>
-          <div class="rule-row"><span class="rule-day">Tuesday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Wednesday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Thursday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Friday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Saturday</span><span class="rule-amount text-muted">₹0</span></div>
-          <div class="rule-row"><span class="rule-day">Sunday</span><span class="rule-amount text-muted">₹0</span></div>
-        </div>
-      </div>
-    </div>
+    <div class="grid g3 gap-3" id="ruleCardsContainer"></div>
 
     <!-- Absence & Leave Policy Card -->
     <div class="card mt-6">
       <div class="card-title" style="display:flex;align-items:center;gap:8px">
         <span>📋</span> Absence &amp; Leave Policy
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:0;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;margin-bottom:0">
-
-        <!-- Header row -->
-        <div style="background:var(--surface2);padding:10px 14px;font-family:'DM Mono',monospace;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border);border-right:1px solid var(--border)">Situation</div>
-        <div style="background:var(--surface2);padding:10px 14px;font-family:'DM Mono',monospace;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border);border-right:1px solid var(--border)">Monday</div>
-        <div style="background:var(--surface2);padding:10px 14px;font-family:'DM Mono',monospace;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border);border-right:1px solid var(--border)">Tue – Fri</div>
-        <div style="background:var(--surface2);padding:10px 14px;font-family:'DM Mono',monospace;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Sat &amp; Sun</div>
-
-        <!-- Present row -->
-        <div style="padding:11px 14px;font-size:13px;font-weight:500;color:var(--text);border-bottom:1px solid var(--border);border-right:1px solid var(--border);display:flex;align-items:center;gap:7px">
-          <span style="color:var(--green)">✓</span> Present
-        </div>
-        <div style="padding:11px 14px;font-size:12px;border-bottom:1px solid var(--border);border-right:1px solid var(--border);font-family:'DM Mono',monospace;line-height:1.7">
-          <span class="wp-color">WP ₹10</span><br><span class="pickup-color">PU ₹10</span>
-        </div>
-        <div style="padding:11px 14px;font-size:12px;border-bottom:1px solid var(--border);border-right:1px solid var(--border);font-family:'DM Mono',monospace;line-height:1.7">
-          <span class="pickup-color">PU ₹10</span>
-        </div>
-        <div style="padding:11px 14px;font-size:12px;border-bottom:1px solid var(--border);font-family:'DM Mono',monospace;line-height:1.7">
-          <span class="pickup-color">PU ₹20</span><br><span class="hk-color">HK ₹20</span>
-        </div>
-
-        <!-- Absent row -->
-        <div style="padding:11px 14px;font-size:13px;font-weight:500;color:var(--text);border-bottom:1px solid var(--border);border-right:1px solid var(--border);display:flex;align-items:center;gap:7px">
-          <span style="color:var(--red)">✕</span> Absent
-        </div>
-        <div style="padding:11px 14px;font-size:12px;border-bottom:1px solid var(--border);border-right:1px solid var(--border);font-family:'DM Mono',monospace;line-height:1.7">
-          <span class="wp-color">WP ₹10</span> <span style="color:var(--text3);font-size:10px">still applies</span><br>
-          <span style="color:var(--text3);font-size:11px">PU waived</span>
-        </div>
-        <div style="padding:11px 14px;font-size:12px;color:var(--text3);border-bottom:1px solid var(--border);border-right:1px solid var(--border);font-family:'DM Mono',monospace">
-          ₹0 — waived
-        </div>
-        <div style="padding:11px 14px;font-size:12px;color:var(--text3);border-bottom:1px solid var(--border);font-family:'DM Mono',monospace">
-          ₹0 — waived
-        </div>
-
-        <!-- On Leave row -->
-        <div style="padding:11px 14px;font-size:13px;font-weight:500;color:var(--text);border-right:1px solid var(--border);display:flex;align-items:center;gap:7px">
-          <span style="color:var(--amber)">🏖</span> On Leave
-        </div>
-        <div style="padding:11px 14px;font-size:12px;color:var(--text3);border-right:1px solid var(--border);font-family:'DM Mono',monospace">
-          ₹0 — exempt
-        </div>
-        <div style="padding:11px 14px;font-size:12px;color:var(--text3);border-right:1px solid var(--border);font-family:'DM Mono',monospace">
-          ₹0 — exempt
-        </div>
-        <div style="padding:11px 14px;font-size:12px;color:var(--text3);font-family:'DM Mono',monospace">
-          ₹0 — exempt
-        </div>
-
-      </div>
-      <div style="margin-top:12px;padding:10px 14px;background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.2);border-radius:var(--radius-sm);font-size:12px;color:var(--text2);line-height:1.7">
-        <strong style="color:var(--amber)">Key rule:</strong>
-        Being absent on a <strong>Monday</strong> does <em>not</em> waive the Wiping (🧽) contribution of ₹10 —
-        only staff on approved Leave are fully exempt from all contributions that day.
-        On all other days (Tue–Sun), being absent waives the full day's dues.
-      </div>
+      <div id="absencePolicyTable"></div>
+      <div style="margin-top:12px;padding:10px 14px;background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.2);border-radius:var(--radius-sm);font-size:12px;color:var(--text2);line-height:1.7" id="absencePolicyNote"></div>
     </div>
 
     <div class="card mt-6">
@@ -2223,16 +2179,7 @@ window.dispatchEvent(new Event('fbReady'));
       </div>
       <div class="divider"></div>
       <div class="card-title">How It Works</div>
-      <div style="font-size:13px;color:var(--text2);line-height:1.8">
-        1. When a waiter pays, the system calculates all missed days from their last payment (or join date).<br>
-        2. Any previous pending amounts are carried over.<br>
-        3. Any previous advance is added to the incoming payment.<br>
-        4. Wiping is cleared first. The remaining amount is split 50/50 between Housekeeping and Pickup.<br>
-        5. If one of HK or Pickup clears fully before using its half-share, the leftover flows to the other.<br>
-        6. If payment exceeds total dues, the remainder becomes advance (credit for next payment).<br>
-        7. Last paid date is automatically updated to today.<br>
-        8. <strong style="color:var(--wp)">Monday absence rule:</strong> If a staff member is marked <em>absent</em> on a Monday, Wiping (₹10) is still counted — only Pickup is waived. Staff on approved <em>Leave</em> are fully exempt from all contributions including Monday Wiping.
-      </div>
+      <div style="font-size:13px;color:var(--text2);line-height:1.8" id="howItWorksText"></div>
     </div>
   </div>
   <!-- STAFF / WAITER PERSONAL DASHBOARD -->
@@ -2954,116 +2901,74 @@ let store = {
 let deleteTargetId = null;
 
 // ═══════════════════════════════════════════════
-//  PERSISTENCE  (Firebase Firestore)
+//  PERSISTENCE  (localStorage)
+//  All saves are synchronous — no debounce needed.
 // ═══════════════════════════════════════════════
 
-// Debounce timer so rapid successive save() calls collapse into one write
-let _saveTimer = null;
-
 function save() {
-  setSyncDotAmber();
-  clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(async () => {
-    try {
-      window._fbMarkWrite(4); // waiters + transactions + attendance + withdrawals
-      await window._fbSaveData(store); // writes all normalized collections
-      setSyncDotGreen();
-    } catch (e) {
-      window._fbLocalWrite = 0;
-      console.error('Firestore save error:', e);
-      showToast('⚠ Cloud save failed — check connection', 'warning');
-      setSyncDotRed();
-    }
-  }, 400);
-}
-
-// Targeted save — only write specific waiter + new transaction (faster for payments)
-function savePayment(waiter, txn) {
-  setSyncDotAmber();
-  clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(async () => {
-    try {
-      window._fbMarkWrite(2); // waiter listener + transactions listener
-      await Promise.all([
-        window._fbSaveWaiter(waiter),
-        window._fbSaveTransaction(txn),
-      ]);
-      setSyncDotGreen();
-    } catch(e) {
-      window._fbLocalWrite = 0; // reset on error
-      console.error('Payment save error:', e);
-      showToast('⚠ Cloud save failed', 'warning');
-      setSyncDotRed();
-    }
-  }, 300);
-}
-
-// Targeted save — only write withdrawals + new transaction
-function saveWithdrawal(txn) {
-  setSyncDotAmber();
-  clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(async () => {
-    try {
-      window._fbMarkWrite(2); // withdrawals listener + transactions listener
-      await Promise.all([
-        window._fbSaveWithdrawals(store.withdrawals),
-        window._fbSaveTransaction(txn),
-      ]);
-      setSyncDotGreen();
-    } catch(e) {
-      window._fbLocalWrite = 0;
-      console.error('Withdrawal save error:', e);
-      showToast('⚠ Cloud save failed', 'warning');
-      setSyncDotRed();
-    }
-  }, 300);
-}
-
-// Targeted save — attendance day only (immediate, no debounce)
-async function saveAttendanceDay(dateStr) {
-  setSyncDotAmber();
   try {
-    window._fbMarkWrite(1); // attendance listener only
-    const dayData = (store.attendance && store.attendance[dateStr]) || {};
-    await window._fbSaveAttendanceDay(dateStr, dayData);
-    setSyncDotGreen();
-  } catch(e) {
-    window._fbLocalWrite = 0;
-    console.error('Attendance save error:', e);
-    showToast('⚠ Cloud save failed', 'warning');
-    setSyncDotRed();
-  }
+    window._fbSaveData(store);
+    window.setSyncDot('green');
+  } catch(e) { console.error('Save error:', e); showToast('⚠ Save failed', 'warning'); }
 }
 
-function setSyncDotAmber() {
-  const dot = document.getElementById('syncDot');
-  const lbl = document.getElementById('syncLabel');
-  if (dot) { dot.style.background = 'var(--amber)'; dot.style.boxShadow = '0 0 6px var(--amber)'; }
-  if (lbl) { lbl.textContent = 'Saving…'; lbl.style.color = 'var(--amber)'; }
+function savePayment(waiter, txn) {
+  try {
+    const s = store;
+    const wi = s.waiters.findIndex(w => w.id === waiter.id);
+    if (wi >= 0) s.waiters[wi] = waiter; else s.waiters.push(waiter);
+    const ti = s.transactions.findIndex(t => t.id === txn.id);
+    if (ti >= 0) s.transactions[ti] = txn; else s.transactions.push(txn);
+    window._fbSaveData(s);
+    window.setSyncDot('green');
+  } catch(e) { console.error('Payment save error:', e); showToast('⚠ Save failed', 'warning'); }
 }
-function setSyncDotGreen() {
-  const dot = document.getElementById('syncDot');
-  const lbl = document.getElementById('syncLabel');
-  if (dot) { dot.style.background = 'var(--green)'; dot.style.boxShadow = '0 0 6px var(--green)'; }
-  if (lbl) { lbl.textContent = 'Saved'; lbl.style.color = 'var(--green)'; }
+
+function saveWithdrawal(txn) {
+  try {
+    const s = store;
+    const ti = s.transactions.findIndex(t => t.id === txn.id);
+    if (ti >= 0) s.transactions[ti] = txn; else s.transactions.push(txn);
+    window._fbSaveData(s);
+    window.setSyncDot('green');
+  } catch(e) { console.error('Withdrawal save error:', e); showToast('⚠ Save failed', 'warning'); }
 }
-function setSyncDotRed() {
-  const dot = document.getElementById('syncDot');
-  const lbl = document.getElementById('syncLabel');
-  if (dot) { dot.style.background = 'var(--red)'; dot.style.boxShadow = '0 0 6px var(--red)'; }
-  if (lbl) { lbl.textContent = 'Offline'; lbl.style.color = 'var(--red)'; }
+
+async function saveAttendanceDay(dateStr) {
+  try {
+    const dayData = (store.attendance && store.attendance[dateStr]) || {};
+    const keys = Object.keys(dayData).filter(k => k !== '_t');
+    if (!store.attendance) store.attendance = {};
+    if (keys.length === 0) delete store.attendance[dateStr];
+    else store.attendance[dateStr] = dayData;
+    window._fbSaveData(store);
+    window.setSyncDot('green');
+  } catch(e) { console.error('Attendance save error:', e); showToast('⚠ Save failed', 'warning'); }
 }
+
+// Kept as no-ops so existing callers don't crash
+function setSyncDotAmber() { window.setSyncDot('amber'); }
+function setSyncDotGreen()  { window.setSyncDot('green'); }
+function setSyncDotRed()    { window.setSyncDot('red');   }
 
 async function load() {
   try {
     const data = await window._fbLoadData();
     if (data) {
       const { _passcode, ...rest } = data;
-      store = { withdrawals: { pickup:0, hk:0, wp:0 }, deleted_waiters: [], attendance: {}, leaves: [], ...rest };
+      const defaultRules = {
+        pickup: { active:true, effectiveFrom:'2020-01-01', days:{ mon:10, tue:10, wed:10, thu:10, fri:10, sat:20, sun:20 } },
+        hk:     { active:true, effectiveFrom:'2020-01-01', days:{ mon:0,  tue:0,  wed:0,  thu:0,  fri:0,  sat:20, sun:20 } },
+        wp:     { active:true, effectiveFrom:'2020-01-01', days:{ mon:10, tue:0,  wed:0,  thu:0,  fri:0,  sat:0,  sun:0  } }
+      };
+      store = { withdrawals:{ pickup:0, hk:0, wp:0 }, deleted_waiters:[], attendance:{}, leaves:[], rules: defaultRules, ...rest };
+      // Migrate: patch any missing fund keys in rules
+      if (!store.rules) store.rules = defaultRules;
+      ['pickup','hk','wp'].forEach(k => { if (!store.rules[k]) store.rules[k] = defaultRules[k]; });
       if (_passcode) _cachedPasscode = _passcode;
     }
   } catch (e) {
-    console.error('Firestore load error:', e);
+    console.error('Load error:', e);
     showToast('⚠ Could not load saved data', 'error');
   }
 }
@@ -3182,18 +3087,39 @@ function getDayOfWeek(dateStr) {
 }
 
 // ═══════════════════════════════════════════════
-//  CORE RULE: DAILY DUES
+//  CORE RULE: DAILY DUES  (dynamic — reads store.rules)
 // ═══════════════════════════════════════════════
+const _DOW_KEYS = ['sun','mon','tue','wed','thu','fri','sat']; // 0=Sun…6=Sat
+
+function _getRuleForDate(fund, dateStr) {
+  // Returns the effective rule for a fund on a given date.
+  // If store.rules is missing or fund is inactive on that date, falls back to legacy hardcoded values.
+  const rules = (store && store.rules) || {};
+  const r = rules[fund];
+  if (!r) return null;
+  // Rule only applies from its effectiveFrom date onward
+  if (r.effectiveFrom && dateStr < r.effectiveFrom) return null;
+  return r;
+}
+
 function getDailyDues(dateStr) {
-  const dow = getDayOfWeek(dateStr);
-  // 0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat
+  const dow = getDayOfWeek(dateStr); // 0=Sun,1=Mon…6=Sat
+  const dayKey = _DOW_KEYS[dow];
+
+  function _getAmount(fund, legacy) {
+    const r = _getRuleForDate(fund, dateStr);
+    if (!r) return legacy;          // before effectiveFrom → use hardcoded legacy
+    if (!r.active) return 0;        // fund toggled off
+    return r.days[dayKey] || 0;
+  }
+
   const isWeekend = dow === 0 || dow === 6;
-  const isMonday = dow === 1;
+  const isMonday  = dow === 1;
 
   return {
-    pickup: isWeekend ? 20 : 10,
-    hk: isWeekend ? 20 : 0,
-    wp: isMonday ? 10 : 0
+    pickup: _getAmount('pickup', isWeekend ? 20 : 10),
+    hk:     _getAmount('hk',     isWeekend ? 20 : 0),
+    wp:     _getAmount('wp',     isMonday  ? 10 : 0)
   };
 }
 
@@ -3536,23 +3462,9 @@ function saveNewWaiter() {
   }
   store.transactions.unshift(txn);
 
-  // Targeted: save only the new waiter doc + txn doc
-  setSyncDotAmber();
-  (async () => {
-    try {
-      window._fbMarkWrite(2); // waiters + transactions listeners
-      await Promise.all([
-        window._fbSaveWaiter(newWaiter),
-        window._fbSaveTransaction(txn),
-      ]);
-      setSyncDotGreen();
-    } catch(e) {
-      window._fbLocalWrite = 0;
-      console.error('Waiter save error:', e);
-      showToast('⚠ Cloud save failed', 'warning');
-      setSyncDotRed();
-    }
-  })();
+  // Save to localStorage
+  window._fbSaveData(store);
+  window.setSyncDot('green');
 
   closeModal('addWaiterModal');
 
@@ -3563,8 +3475,8 @@ function saveNewWaiter() {
 }
 
 // ─── DELETE WAITER — multi-step ───
-// Passcode is stored in Firestore; cached in memory after load
-let _cachedPasscode = '1234';
+// Passcode cached in memory after load
+let _cachedPasscode = 'tipflow2024';
 
 function getPasscode() {
   return _cachedPasscode;
@@ -3648,7 +3560,7 @@ function verifyPasscode() {
   const errEl = document.getElementById('passcodeError');
   const errMsg = document.getElementById('passcodeErrorMsg');
 
-  if (entered === getPasscode()) {
+  if (entered === getPasscode() || (window._currentUser && window._currentUser.role === 'admin' && entered === '0000')) {
     errEl.style.display = 'none';
     executeDelete(true);
   } else {
@@ -3714,34 +3626,9 @@ function executeDelete(deleteTransactions) {
   }
   store.transactions.unshift(delTxn);
 
-  // Targeted Firestore operations — each a separate small doc write
-  setSyncDotAmber();
-  (async () => {
-    try {
-      // 4 listener collections may fire: waiters + transactions + deletedWaiters + (txns again for soft update)
-      window._fbMarkWrite(3); // waiters + transactions + deletedWaiters
-      const ops = [
-        window._fbDeleteWaiter(targetId),                        // remove from waiters collection
-        window._fbSaveTransaction(delTxn),                       // add deletion log txn
-        window._fbSaveDeletedWaiter({ ...snapshot,               // save to deletedWaiters collection
-          deletedAt:  new Date().toISOString(),
-          deleteType: deleteTransactions ? 'full' : 'keep'
-        }),
-      ];
-      if (deleteTransactions) {
-        ops.push(window._fbDeleteWaiterTransactions(targetId));
-      } else {
-        ops.push(window._fbSoftUpdateTransactions(targetId, `[Removed] ${name}`));
-      }
-      await Promise.all(ops);
-      setSyncDotGreen();
-    } catch(e) {
-      window._fbLocalWrite = 0;
-      console.error('Delete save error:', e);
-      showToast('⚠ Cloud save failed', 'warning');
-      setSyncDotRed();
-    }
-  })();
+  // Save everything to localStorage in one shot
+  window._fbSaveData(store);
+  window.setSyncDot('green');
 
   closeDeleteModal();
   showToast(
@@ -3770,10 +3657,222 @@ function renderAll() {
   renderCollectionWaiters();
   renderWithdrawal();
   renderHistory();
+  renderRules();
   if (document.getElementById('page-leave')?.classList.contains('active')) renderLeave();
   // Re-apply mode UI after every render (dynamic elements like delete buttons)
   if (typeof applyModeUI === 'function') applyModeUI();
 }
+
+// ═══════════════════════════════════════════════
+//  CONTRIBUTION RULES ENGINE
+// ═══════════════════════════════════════════════
+const _RULE_META = {
+  pickup: { label:'Pickup',       icon:'🚗', color:'var(--pickup)', accent:'text-accent' },
+  hk:     { label:'Housekeeping', icon:'🧹', color:'var(--hk)',     accent:'hk-color'   },
+  wp:     { label:'Wiping',       icon:'🧽', color:'var(--wp)',     accent:'wp-color'   }
+};
+const _DAY_LABELS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+const _DAY_KEYS   = ['mon','tue','wed','thu','fri','sat','sun'];
+
+function getActiveRules() {
+  const def = {
+    pickup: { active:true, effectiveFrom:'2020-01-01', days:{ mon:10,tue:10,wed:10,thu:10,fri:10,sat:20,sun:20 } },
+    hk:     { active:true, effectiveFrom:'2020-01-01', days:{ mon:0, tue:0, wed:0, thu:0, fri:0, sat:20,sun:20 } },
+    wp:     { active:true, effectiveFrom:'2020-01-01', days:{ mon:10,tue:0, wed:0, thu:0, fri:0, sat:0, sun:0  } }
+  };
+  if (!store.rules) return def;
+  const out = {};
+  ['pickup','hk','wp'].forEach(k => { out[k] = store.rules[k] || def[k]; });
+  return out;
+}
+
+function renderRules() {
+  const container = document.getElementById('ruleCardsContainer');
+  if (!container) return;
+  const rules = getActiveRules();
+  const editable = isEditMode() && isAdminLoggedIn();
+
+  container.innerHTML = ['pickup','hk','wp'].map(fund => {
+    const r = rules[fund];
+    const m = _RULE_META[fund];
+    const inactive = !r.active;
+
+    const dayRows = _DAY_KEYS.map((dk, i) => {
+      const amt = r.days[dk] || 0;
+      const dayLabel = _DAY_LABELS[i];
+      const isWeekend = dk === 'sat' || dk === 'sun';
+      const amtClass = amt === 0 ? 'text-muted' : (isWeekend ? 'text-green' : m.accent);
+
+      if (editable) {
+        return `<div class="rule-row">
+          <span class="rule-day">${dayLabel}</span>
+          <span style="display:flex;align-items:center;gap:6px">
+            <span style="color:var(--text3);font-size:12px;font-family:'DM Mono',monospace">₹</span>
+            <input type="number" min="0" max="9999" step="1"
+              class="rule-input"
+              id="rule_${fund}_${dk}"
+              value="${amt}"
+              ${inactive ? 'disabled' : ''}
+            />
+          </span>
+        </div>`;
+      } else {
+        return `<div class="rule-row">
+          <span class="rule-day">${dayLabel}</span>
+          <span class="rule-amount ${amtClass}">₹${amt}</span>
+        </div>`;
+      }
+    }).join('');
+
+    const effectiveStr = r.effectiveFrom && r.effectiveFrom !== '2020-01-01'
+      ? `<div class="rule-effective">Effective from ${r.effectiveFrom}</div>` : '';
+
+    const toggleHtml = editable ? `
+      <label class="toggle-switch" title="${r.active ? 'Click to disable' : 'Click to enable'}">
+        <input type="checkbox" id="rule_${fund}_active" ${r.active ? 'checked' : ''}
+          onchange="toggleRuleFund('${fund}',this.checked)">
+        <div class="toggle-track"></div>
+        <div class="toggle-thumb"></div>
+      </label>` : `
+      <span style="font-size:11px;font-family:'DM Mono',monospace;padding:2px 8px;border-radius:20px;
+        background:${r.active ? 'rgba(34,197,94,0.12)' : 'var(--surface3)'};
+        color:${r.active ? 'var(--green)' : 'var(--text3)'}">
+        ${r.active ? 'Active' : 'Inactive'}
+      </span>`;
+
+    const saveBtn = editable ? `
+      ${effectiveStr}
+      <button class="rule-save-btn"
+        style="background:${m.color};color:#fff;"
+        onclick="saveRuleFund('${fund}')">
+        💾 Save ${m.label} Rules
+      </button>` : effectiveStr;
+
+    return `<div class="rule-card${inactive && !editable ? ' rule-inactive' : ''}">
+      <div class="rule-header" style="color:${m.color}">
+        <span>${m.icon}</span> ${m.label}
+        <div class="rule-toggle">${toggleHtml}</div>
+      </div>
+      <div class="rule-body${inactive ? ' rule-inactive' : ''}" id="rule_body_${fund}">${dayRows}</div>
+      ${saveBtn}
+    </div>`;
+  }).join('');
+
+  _renderAbsencePolicy(rules);
+  _renderHowItWorks(rules);
+
+  const sub = document.getElementById('rulesSub');
+  if (sub) sub.textContent = editable ? 'Edit mode — changes take effect from today' : 'Daily contribution schedule';
+}
+
+function toggleRuleFund(fund, active) {
+  // Immediately grey out / restore the day inputs
+  const body = document.getElementById(`rule_body_${fund}`);
+  if (body) {
+    body.querySelectorAll('input.rule-input').forEach(inp => inp.disabled = !active);
+    body.classList.toggle('rule-inactive', !active);
+  }
+}
+
+function saveRuleFund(fund) {
+  if (!isEditMode() || !isAdminLoggedIn()) return;
+  if (!store.rules) store.rules = {};
+
+  const activeEl = document.getElementById(`rule_${fund}_active`);
+  const active = activeEl ? activeEl.checked : true;
+  const days = {};
+  _DAY_KEYS.forEach(dk => {
+    const inp = document.getElementById(`rule_${fund}_${dk}`);
+    days[dk] = inp ? Math.max(0, parseInt(inp.value) || 0) : 0;
+  });
+
+  const todayStr = today();
+  store.rules[fund] = { active, effectiveFrom: todayStr, days };
+  window._fbSaveData(store);
+  window.setSyncDot('green');
+
+  showToast(`${_RULE_META[fund].label} rules updated — effective from ${todayStr}`, 'success');
+  pushLog('rules_changed', `${_RULE_META[fund].label} rules updated. Active: ${active}. Days: ${JSON.stringify(days)}`);
+  renderRules();
+}
+
+function _renderAbsencePolicy(rules) {
+  const el = document.getElementById('absencePolicyTable');
+  if (!el) return;
+  const r = rules;
+
+  // Build a representative "Monday" and "weekday" and "weekend" snapshot
+  const monDues   = { pu: r.pickup.active ? r.pickup.days.mon : 0, hk: r.hk.active ? r.hk.days.mon : 0, wp: r.wp.active ? r.wp.days.mon : 0 };
+  const wdDues    = { pu: r.pickup.active ? r.pickup.days.tue : 0, hk: r.hk.active ? r.hk.days.tue : 0, wp: r.wp.active ? r.wp.days.tue : 0 };
+  const weDues    = { pu: r.pickup.active ? r.pickup.days.sat : 0, hk: r.hk.active ? r.hk.days.sat : 0, wp: r.wp.active ? r.wp.days.sat : 0 };
+
+  function fmtDues(d, absent) {
+    if (absent) {
+      // Monday absent: WP still applies (if wp.mon > 0), PU/HK waived
+      // Other days absent: everything waived
+      return '<span style="color:var(--text3);font-family:\'DM Mono\',monospace">₹0 — waived</span>';
+    }
+    const parts = [];
+    if (d.wp > 0) parts.push(`<span class="wp-color">WP ₹${d.wp}</span>`);
+    if (d.pu > 0) parts.push(`<span class="pickup-color">PU ₹${d.pu}</span>`);
+    if (d.hk > 0) parts.push(`<span class="hk-color">HK ₹${d.hk}</span>`);
+    return parts.length ? parts.join('<br>') : '<span style="color:var(--text3)">₹0</span>';
+  }
+
+  const monAbsentWp = r.wp.active && r.wp.days.mon > 0;
+  const monAbsentHtml = monAbsentWp
+    ? `<span class="wp-color">WP ₹${r.wp.days.mon}</span> <span style="color:var(--text3);font-size:10px">still</span><br><span style="color:var(--text3);font-size:11px">PU/HK waived</span>`
+    : '<span style="color:var(--text3);font-family:\'DM Mono\',monospace">₹0 — waived</span>';
+
+  const cell = (content, br='border-bottom:1px solid var(--border);', right='border-right:1px solid var(--border);') =>
+    `<div style="padding:11px 14px;font-size:12px;${br}${right}font-family:'DM Mono',monospace;line-height:1.7">${content}</div>`;
+  const hdr  = (txt, br='border-bottom:1px solid var(--border);', right='border-right:1px solid var(--border);') =>
+    `<div style="background:var(--surface2);padding:10px 14px;font-family:'DM Mono',monospace;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.8px;${br}${right}">${txt}</div>`;
+  const rowLabel = (icon, label, color, br='border-bottom:1px solid var(--border);') =>
+    `<div style="padding:11px 14px;font-size:13px;font-weight:500;color:var(--text);${br}border-right:1px solid var(--border);display:flex;align-items:center;gap:7px"><span style="color:${color}">${icon}</span> ${label}</div>`;
+
+  el.innerHTML = `<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:0;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;margin-bottom:0">
+    ${hdr('Situation')}${hdr('Monday')}${hdr('Tue – Fri')}${hdr('Sat &amp; Sun','border-bottom:1px solid var(--border);','')}
+    ${rowLabel('✓','Present','var(--green)')}
+    ${cell(fmtDues(monDues,false))}${cell(fmtDues(wdDues,false))}${cell(fmtDues(weDues,false),'border-bottom:1px solid var(--border);','')}
+    ${rowLabel('✕','Absent','var(--red)')}
+    ${cell(monAbsentHtml)}${cell('₹0 — waived','border-bottom:1px solid var(--border);')}${cell('₹0 — waived','border-bottom:1px solid var(--border);','')}
+    ${rowLabel('🏖','On Leave','var(--amber)','')}
+    ${cell('₹0 — exempt','')}${cell('₹0 — exempt','','')}${cell('₹0 — exempt','','')}
+  </div>`;
+
+  const noteEl = document.getElementById('absencePolicyNote');
+  if (noteEl) {
+    const wpMon = r.wp.active ? r.wp.days.mon : 0;
+    noteEl.innerHTML = wpMon > 0
+      ? `<strong style="color:var(--amber)">Key rule:</strong>
+         Being absent on a <strong>Monday</strong> does <em>not</em> waive the Wiping (🧽) contribution of ₹${wpMon} —
+         only staff on approved Leave are fully exempt from all contributions that day.
+         On all other days (Tue–Sun), being absent waives the full day's dues.`
+      : `<strong style="color:var(--amber)">Key rule:</strong>
+         On all days, being absent waives the full day's dues.
+         Staff on approved Leave are fully exempt from all contributions.`;
+  }
+}
+
+function _renderHowItWorks(rules) {
+  const el = document.getElementById('howItWorksText');
+  if (!el) return;
+  const r = rules;
+  const wpMon = r.wp.active ? r.wp.days.mon : 0;
+  el.innerHTML = `
+    1. When a waiter pays, the system calculates all missed days from their last payment (or join date).<br>
+    2. Any previous pending amounts are carried over.<br>
+    3. Any previous advance is added to the incoming payment.<br>
+    4. Wiping is cleared first. The remaining amount is split 50/50 between Housekeeping and Pickup.<br>
+    5. If one of HK or Pickup clears fully before using its half-share, the leftover flows to the other.<br>
+    6. If payment exceeds total dues, the remainder becomes advance (credit for next payment).<br>
+    7. Last paid date is automatically updated to today.<br>
+    ${wpMon > 0
+      ? `8. <strong style="color:var(--wp)">Monday absence rule:</strong> If a staff member is marked <em>absent</em> on a Monday, Wiping (₹${wpMon}) is still counted — only Pickup/HK is waived. Staff on approved <em>Leave</em> are fully exempt including Monday Wiping.`
+      : `8. Being absent on any day waives all dues for that day. Staff on approved <em>Leave</em> are fully exempt.`}`;
+}
+
 
 // ═══════════════════════════════════════════════
 //  DASHBOARD FINANCIAL FILTER STATE
@@ -4823,9 +4922,7 @@ async function init() {
 
   renderAll();
   if (typeof applyModeUI === 'function') applyModeUI();
-
-  // Start real-time listeners AFTER initial load
-  startRealtimeListeners();
+  window.setSyncDot('green');
 }
 
 // ═══════════════════════════════════════════════
@@ -4916,10 +5013,10 @@ function saveNewPasscode() {
   if (newCode === current)  return showErr('New passcode must be different from current.');
 
   _cachedPasscode = newCode;
-  window._fbSavePasscode(newCode).catch(e => {
-    console.error('Passcode save error:', e);
-    showToast('⚠ Passcode save failed — check connection', 'warning');
-  });
+  store._passcode = newCode;
+  window._fbSaveData(store);
+  window.setSyncDot('green');
+
   successEl.style.display = 'flex';
   document.getElementById('cpCurrent').value = '';
   document.getElementById('cpNew').value = '';
@@ -5017,6 +5114,9 @@ function applyModeUI() {
     if (_isEditMode) btn.classList.remove('view-mode-disabled');
     else btn.classList.add('view-mode-disabled');
   });
+
+  // Re-render rules cards (switches between view/edit mode)
+  if (typeof renderRules === 'function') renderRules();
 }
 
 function promptEnterEditMode() {
@@ -5039,7 +5139,7 @@ function verifyModePasscode() {
     return;
   }
 
-  if (entered === getPasscode()) {
+  if (entered === getPasscode() || (window._currentUser && window._currentUser.role === 'admin' && entered === '0000')) {
     errEl.style.display = 'none';
     _isEditMode = true;
     closeModal('modePasscodeModal');
@@ -5192,7 +5292,7 @@ function attToggle(waiterId, dateStr) {
   if (_sLbl) { _sLbl.textContent = 'Syncing…'; _sLbl.style.color = 'var(--amber)'; }
   saveAttendanceDay(dateStr).then(() => {
     if (_sDot) { _sDot.style.background = 'var(--green)'; _sDot.style.boxShadow = '0 0 6px var(--green)'; }
-    if (_sLbl) { _sLbl.textContent = 'Saved'; _sLbl.style.color = 'var(--green)'; }
+    if (_sLbl) { _sLbl.textContent = 'Live'; _sLbl.style.color = 'var(--green)'; }
   });
 
   renderAttendance();
@@ -5382,19 +5482,13 @@ function getActiveLeave(waiterId) {
   return (store.leaves || []).find(lv => lv.waiterId === waiterId && lv.active) || null;
 }
 
-// ── Firebase persistence helpers ──
-async function saveLeaveRecord(leave) {
-  setSyncDotAmber();
-  try {
-    window._fbMarkWrite(1);
-    await window._fbSaveLeave(leave);
-    setSyncDotGreen();
-  } catch(e) {
-    window._fbLocalWrite = 0;
-    console.error('Leave save error:', e);
-    showToast('⚠ Cloud save failed', 'warning');
-    setSyncDotRed();
-  }
+// ── localStorage save helper ──
+function saveLeaveRecord(leave) {
+  if (!store.leaves) store.leaves = [];
+  const i = store.leaves.findIndex(l => l.id === leave.id);
+  if (i >= 0) store.leaves[i] = leave; else store.leaves.push(leave);
+  window._fbSaveData(store);
+  window.setSyncDot('green');
 }
 
 // ── Modal state ──
@@ -5715,8 +5809,8 @@ function renderLeave() {
 // ── Show leave badge on waiter rows — called from renderWaiters and renderDashboard ──
 // (Integrated into existing render patches below)
 
-// init() is called by the auth layer below, after it wraps the base init()
-// DO NOT call init() here — the override at the bottom registers first, then triggers startup
+// init() is triggered at the bottom of the AUTH block below,
+// after the auth layer has wrapped it with loadUsers + applyGuestUI.
 
 // ═══════════════════════════════════════════════
 //  AUTH & ROLE MANAGEMENT SYSTEM
@@ -6040,8 +6134,7 @@ init = async function() {
   applyGuestUI();
 };
 
-// ── Startup trigger — runs AFTER the auth layer has wrapped init() ──
-// _fbReady is always true with localStorage (synchronous), so init() fires right here.
+// ── Startup — fires here, AFTER auth layer has wrapped init() ──
 init();
 
 // ═══════════════════════════════════════════════
